@@ -2,6 +2,55 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "aiobreaker"
+dynamic = ["version"]
+description = "Asynchronous Python implementation of the Circuit Breaker pattern."
+readme = "readme.rst"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Alexander Lyon", email = "arlyon@me.com" },
+]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "redis>=4.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/arlyon/aiobreaker"
+
+[project.optional-dependencies]
+test = [
+    "fakeredis>=2.20",
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "mypy",
+    "ruff",
+    "codecov",
+    "pytest-cov",
+]
+docs = [
+    "sphinx",
+    "sphinx_rtd_theme",
+    "sphinx-autobuild",
+    "sphinx-autodoc-typehints",
+]
+
+[tool.setuptools]
+packages = ["aiobreaker", "aiobreaker.storage"]
+
+[tool.setuptools.dynamic]
+version = { attr = "aiobreaker.version.__version__" }
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
