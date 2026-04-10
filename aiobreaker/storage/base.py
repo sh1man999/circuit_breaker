@@ -6,12 +6,14 @@ from aiobreaker.state import CircuitBreakerState
 
 class CircuitBreakerStorage(ABC):
     """
-    Defines the underlying storage for a circuit breaker - the underlying
-    implementation should be in a subclass that overrides the method this
-    class defines.
+    Defines the underlying storage for a circuit breaker. Concrete subclasses
+    must implement every abstract method declared below.
+
+    All state-mutating and state-reading methods are coroutines so that they
+    can be used uniformly with both in-memory and remote backends (e.g. Redis).
     """
 
-    def __init__(self, name: str):
+    def __init__(self, name: str) -> None:
         """
         Creates a new instance identified by `name`.
         """
@@ -20,55 +22,49 @@ class CircuitBreakerStorage(ABC):
     @property
     def name(self) -> str:
         """
-        Returns a human friendly name that identifies this state.
+        Returns a human friendly name that identifies this storage backend.
         """
         return self._name
 
-    @property
     @abstractmethod
-    def state(self) -> CircuitBreakerState:
+    async def get_state(self) -> CircuitBreakerState:
         """
-        Override this method to retrieve the current circuit breaker state.
-        """
-
-    @state.setter
-    @abstractmethod
-    def state(self, state: CircuitBreakerState):
-        """
-        Override this method to set the current circuit breaker state.
+        Returns the current circuit breaker state.
         """
 
     @abstractmethod
-    def increment_counter(self):
+    async def set_state(self, state: CircuitBreakerState) -> None:
         """
-        Override this method to increase the failure counter by one.
+        Sets the current circuit breaker state.
         """
 
     @abstractmethod
-    def reset_counter(self):
+    async def increment_counter(self) -> None:
         """
-        Override this method to set the failure counter to zero.
-        """
-
-    @property
-    @abstractmethod
-    def counter(self) -> int:
-        """
-        Override this method to retrieve the current value of the failure counter.
+        Increases the failure counter by one.
         """
 
-    @property
     @abstractmethod
-    def opened_at(self) -> datetime:
+    async def reset_counter(self) -> None:
         """
-        Override this method to retrieve the most recent value of when the
-        circuit was opened.
+        Sets the failure counter to zero.
         """
 
-    @opened_at.setter
     @abstractmethod
-    def opened_at(self, date_time: datetime):
+    async def get_counter(self) -> int:
         """
-        Override this method to set the most recent value of when the circuit
-        was opened.
+        Returns the current value of the failure counter.
+        """
+
+    @abstractmethod
+    async def get_opened_at(self) -> datetime | None:
+        """
+        Returns the most recent value of when the circuit was opened, or
+        ``None`` if the circuit has never been opened.
+        """
+
+    @abstractmethod
+    async def set_opened_at(self, date_time: datetime) -> None:
+        """
+        Sets the most recent value of when the circuit was opened.
         """

@@ -1,34 +1,50 @@
-from typing import Callable
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from .circuitbreaker import CircuitBreaker
+    from .state import CircuitBreakerBaseState
 
 
 class CircuitBreakerListener:
     """
-    Listener class used to plug code to a CircuitBreaker instance when certain events happen.
+    Listener class used to plug code into a :class:`CircuitBreaker` instance
+    so that user-supplied callbacks fire when certain events happen.
 
-    todo async listener handlers
+    Listener methods are synchronous by design — they should not perform
+    blocking I/O. If you need async work, schedule a task from inside the
+    listener (e.g. via :func:`asyncio.create_task`).
     """
 
-    def before_call(self, breaker: 'CircuitBreaker', func: Callable, *args, **kwargs) -> None:
+    def before_call(
+        self,
+        breaker: "CircuitBreaker",
+        func: Callable[..., Awaitable[Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
         """
-        Called before a function is executed over a breaker.
-
-        :param breaker: The breaker that is used.
-        :param func: The function that is called.
-        :param args: The args to the function.
-        :param kwargs: The kwargs to the function.
-        """
-
-    def failure(self, breaker: 'CircuitBreaker', exception: Exception) -> None:
-        """
-        Called when a function executed over the circuit breaker 'breaker' fails.
+        Called before a function is executed via the breaker.
         """
 
-    def success(self, breaker: 'CircuitBreaker') -> None:
+    def failure(
+        self, breaker: "CircuitBreaker", exception: BaseException
+    ) -> None:
         """
-        Called when a function executed over the circuit breaker 'breaker' succeeds.
+        Called when a function executed over the breaker fails.
         """
 
-    def state_change(self, breaker: 'CircuitBreaker', old: 'CircuitBreakerState', new: 'CircuitBreakerState') -> None:
+    def success(self, breaker: "CircuitBreaker") -> None:
         """
-        Called when the state of the circuit breaker 'breaker' changes.
+        Called when a function executed over the breaker succeeds.
+        """
+
+    def state_change(
+        self,
+        breaker: "CircuitBreaker",
+        old: Optional["CircuitBreakerBaseState"],
+        new: "CircuitBreakerBaseState",
+    ) -> None:
+        """
+        Called when the state of the breaker changes.
         """

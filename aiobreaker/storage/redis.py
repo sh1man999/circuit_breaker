@@ -1,164 +1,207 @@
 import calendar
 import logging
-import time
-from datetime import datetime
+from datetime import datetime, timezone
+
+from redis.asyncio import Redis
+from redis.exceptions import RedisError, WatchError
 
 from aiobreaker.state import CircuitBreakerState
-from .base import CircuitBreakerStorage
 
-try:
-    from redis.exceptions import RedisError
-except ImportError:
-    HAS_REDIS_SUPPORT = False
-    RedisError = None
-else:
-    HAS_REDIS_SUPPORT = True
+from .base import CircuitBreakerStorage
 
 
 class CircuitRedisStorage(CircuitBreakerStorage):
     """
-    Implements a `CircuitBreakerStorage` using redis.
+    Implements a :class:`CircuitBreakerStorage` backed by an asynchronous
+    ``redis.asyncio.Redis`` client.
+
+    The constructor performs no I/O — required for usage in dependency
+    injection containers where ``__init__`` cannot be a coroutine. Use
+    :meth:`create` to obtain an instance with its keys initialized in Redis.
     """
 
-    BASE_NAMESPACE = 'aiobreaker'
+    BASE_NAMESPACE = "aiobreaker"
 
     logger = logging.getLogger(__name__)
 
-    def __init__(self, state: CircuitBreakerState, redis_object, namespace=None,
-                 fallback_circuit_state=CircuitBreakerState.CLOSED):
+    def __init__(
+        self,
+        redis_object: Redis,
+        namespace: str | None = None,
+        fallback_circuit_state: CircuitBreakerState = CircuitBreakerState.CLOSED,
+    ) -> None:
         """
-        Creates a new instance with the given `state` and `redis` object. The
-        redis object should be similar to pyredis' StrictRedis class. If there
-        are any connection issues with redis, the `fallback_circuit_state` is
-        used to determine the state of the circuit.
+        Creates a new instance bound to the given async ``redis_object``.
+
+        :param redis_object: A ``redis.asyncio.Redis`` instance.
+        :param namespace: Optional namespace prepended to all keys.
+        :param fallback_circuit_state: State returned when Redis is unreachable.
         """
+        super().__init__("redis")
+        self._redis: Redis = redis_object
+        self._namespace_name: str | None = namespace
+        self._fallback_circuit_state: CircuitBreakerState = fallback_circuit_state
 
-        # Module does not exist, so this feature is not available
-        if not HAS_REDIS_SUPPORT:
-            raise ImportError("CircuitRedisStorage can only be used if the required dependencies exist")
+    @classmethod
+    async def create(
+        cls,
+        redis_object: Redis,
+        initial_state: CircuitBreakerState = CircuitBreakerState.CLOSED,
+        namespace: str | None = None,
+        fallback_circuit_state: CircuitBreakerState = CircuitBreakerState.CLOSED,
+    ) -> "CircuitRedisStorage":
+        """
+        Async factory: builds an instance and seeds the Redis keys via SETNX.
 
-        super(CircuitRedisStorage, self).__init__('redis')
+        Existing values are preserved — only missing keys are populated.
+        """
+        instance = cls(redis_object, namespace, fallback_circuit_state)
+        await instance._initialize_redis_state(initial_state)
+        return instance
 
-        try:
-            self.RedisError = __import__('redis').exceptions.RedisError
-        except ImportError:
-            # Module does not exist, so this feature is not available
-            raise ImportError("CircuitRedisStorage can only be used if 'redis' is available")
+    async def _initialize_redis_state(self, state: CircuitBreakerState) -> None:
+        """
+        Seeds the failure counter and state keys atomically using SETNX.
+        """
+        await self._redis.setnx(self._namespace("fail_counter"), 0)
+        await self._redis.setnx(self._namespace("state"), state.name)
 
-        self._redis = redis_object
-        self._namespace_name = namespace
-        self._fallback_circuit_state = fallback_circuit_state
-        self._initial_state = state
-
-        self._initialize_redis_state(self._initial_state)
-
-    def _initialize_redis_state(self, state: CircuitBreakerState):
-        self._redis.setnx(self._namespace('fail_counter'), 0)
-        self._redis.setnx(self._namespace('state'), state.name)
-
-    @property
-    def state(self):
+    async def get_state(self) -> CircuitBreakerState:
         """
         Returns the current circuit breaker state.
-    
-        If the circuit breaker state on Redis is missing, re-initialize it
-        with the fallback circuit state and reset the fail counter.
+
+        If the state key is missing in Redis it is re-initialized with the
+        configured fallback state. On any RedisError the fallback state is
+        returned.
         """
         try:
-            state_bytes = self._redis.get(self._namespace('state'))
-        except self.RedisError:
-            self.logger.error('RedisError: falling back to default circuit state', exc_info=True)
+            state_bytes = await self._redis.get(self._namespace("state"))
+        except RedisError:
+            self.logger.error(
+                "RedisError: falling back to default circuit state",
+                exc_info=True,
+            )
             return self._fallback_circuit_state
-    
+
         if state_bytes is not None:
-            state_str = state_bytes.decode('utf-8')
-            return getattr(CircuitBreakerState, state_str)
-        else:
-            self._initialize_redis_state(self._fallback_circuit_state)
-            return self._fallback_circuit_state
+            state_str = (
+                state_bytes.decode("utf-8")
+                if isinstance(state_bytes, (bytes, bytearray))
+                else str(state_bytes)
+            )
+            try:
+                return CircuitBreakerState[state_str]
+            except KeyError:
+                self.logger.error(
+                    "Unknown circuit state %r in Redis; falling back",
+                    state_str,
+                )
+                return self._fallback_circuit_state
 
-    @state.setter
-    def state(self, state):
+        await self._initialize_redis_state(self._fallback_circuit_state)
+        return self._fallback_circuit_state
+
+    async def set_state(self, state: CircuitBreakerState) -> None:
         """
-        Set the current circuit breaker state to `state`.
+        Sets the current circuit breaker state.
         """
         try:
-            self._redis.set(self._namespace('state'), state.name)
-        except self.RedisError:
-            self.logger.error('RedisError', exc_info=True)
+            await self._redis.set(self._namespace("state"), state.name)
+        except RedisError:
+            self.logger.error("RedisError", exc_info=True)
 
-    def increment_counter(self):
+    async def increment_counter(self) -> None:
         """
         Increases the failure counter by one.
         """
         try:
-            self._redis.incr(self._namespace('fail_counter'))
-        except self.RedisError:
-            self.logger.error('RedisError', exc_info=True)
+            await self._redis.incr(self._namespace("fail_counter"))
+        except RedisError:
+            self.logger.error("RedisError", exc_info=True)
 
-    def reset_counter(self):
+    async def reset_counter(self) -> None:
         """
         Sets the failure counter to zero.
         """
         try:
-            self._redis.set(self._namespace('fail_counter'), 0)
-        except self.RedisError:
-            self.logger.error('RedisError', exc_info=True)
+            await self._redis.set(self._namespace("fail_counter"), 0)
+        except RedisError:
+            self.logger.error("RedisError", exc_info=True)
 
-    @property
-    def counter(self):
+    async def get_counter(self) -> int:
         """
         Returns the current value of the failure counter.
         """
         try:
-            value = self._redis.get(self._namespace('fail_counter'))
-            if value:
-                return int(value)
-            else:
-                return 0
-        except self.RedisError:
-            self.logger.error('RedisError: Assuming no errors', exc_info=True)
+            value = await self._redis.get(self._namespace("fail_counter"))
+        except RedisError:
+            self.logger.error("RedisError: assuming no errors", exc_info=True)
             return 0
 
-    @property
-    def opened_at(self):
+        if value is None:
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            self.logger.error(
+                "Invalid counter value %r in Redis; assuming 0", value
+            )
+            return 0
+
+    async def get_opened_at(self) -> datetime | None:
         """
-        Returns a datetime object of the most recent value of when the circuit
-        was opened.
+        Returns a timezone-aware UTC ``datetime`` of when the circuit was last
+        opened, or ``None`` if it has never been opened.
         """
         try:
-            timestamp = self._redis.get(self._namespace('opened_at'))
-            if timestamp:
-                return datetime(*time.gmtime(int(timestamp))[:6])
-        except self.RedisError:
-            self.logger.error('RedisError', exc_info=True)
+            timestamp = await self._redis.get(self._namespace("opened_at"))
+        except RedisError:
+            self.logger.error("RedisError", exc_info=True)
             return None
 
-    @opened_at.setter
-    def opened_at(self, now):
-        """
-        Atomically sets the most recent value of when the circuit was opened
-        to `now`. Stored in redis as a simple integer of unix epoch time.
-        To avoid timezone issues between different systems, the passed in
-        datetime should be in UTC.
-        """
+        if timestamp is None:
+            return None
         try:
-            key = self._namespace('opened_at')
+            return datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
+        except (TypeError, ValueError):
+            self.logger.error(
+                "Invalid opened_at value %r in Redis; treating as missing",
+                timestamp,
+            )
+            return None
 
-            def set_if_greater(pipe):
-                current_value = pipe.get(key)
-                next_value = int(calendar.timegm(now.timetuple()))
-                pipe.multi()
-                if not current_value or next_value > int(current_value):
-                    pipe.set(key, next_value)
+    async def set_opened_at(self, date_time: datetime) -> None:
+        """
+        Atomically updates the ``opened_at`` value, but only if the new value
+        is strictly greater than the existing one (so that older "open" events
+        cannot overwrite newer ones in a multi-process setup).
 
-            self._redis.transaction(set_if_greater, key)
-        except self.RedisError:
-            self.logger.error('RedisError', exc_info=True)
+        ``date_time`` should be a UTC datetime; it is converted to a unix
+        epoch integer for storage.
+        """
+        key = self._namespace("opened_at")
+        next_value = int(calendar.timegm(date_time.utctimetuple()))
 
-    def _namespace(self, key):
+        try:
+            async with self._redis.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(key)
+                        current = await pipe.get(key)
+                        if current is None or next_value > int(current):
+                            pipe.multi()  # type: ignore[no-untyped-call]
+                            await pipe.set(key, next_value)
+                            await pipe.execute()
+                        else:
+                            await pipe.unwatch()  # type: ignore[no-untyped-call]
+                        break
+                    except WatchError:
+                        continue
+        except RedisError:
+            self.logger.error("RedisError", exc_info=True)
+
+    def _namespace(self, key: str) -> str:
         name_parts = [self.BASE_NAMESPACE, key]
         if self._namespace_name:
             name_parts.insert(0, self._namespace_name)
-
-        return ':'.join(name_parts)
+        return ":".join(name_parts)

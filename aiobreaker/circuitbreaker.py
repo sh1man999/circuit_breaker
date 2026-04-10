@@ -1,314 +1,347 @@
 import asyncio
 import inspect
-from datetime import timedelta, datetime
+from collections.abc import Awaitable, Callable, Iterable
+from datetime import datetime, timedelta, timezone
 from functools import wraps
-from typing import Optional, Iterable, Callable, Coroutine, Type, List, Union, Tuple
+from typing import (
+    Any,
+    TypeAlias,
+    TypeVar,
+)
 
 from .listener import CircuitBreakerListener
-from .state import CircuitBreakerState, CircuitBreakerBaseState
+from .state import (
+    CircuitBreakerBaseState,
+    CircuitBreakerError,
+    CircuitBreakerState,
+)
 from .storage.base import CircuitBreakerStorage
 from .storage.memory import CircuitMemoryStorage
+
+T = TypeVar("T")
+
+ExcludeItem: TypeAlias = type[BaseException] | Callable[[BaseException], bool]
 
 
 class CircuitBreaker:
     """
-    A circuit breaker is a route through which functions are executed.
+    A circuit breaker is a route through which async functions are executed.
     When a function is executed via a circuit breaker, the breaker is notified.
-    Multiple failed attempts will open the breaker and block additional calls.
+    Multiple failed attempts will open the breaker and block additional calls
+    until a configurable timeout has elapsed.
+
+    Because the underlying storage is asynchronous, breakers must be created
+    via :meth:`create` (or have ``_ensure_state_initialized`` awaited at least
+    once before use). The constructor itself performs no I/O so the class is
+    safe to instantiate from synchronous DI containers.
     """
 
-    def __init__(self, fail_max=5,
-                 timeout_duration: Optional[timedelta] = None,
-                 exclude: Optional[Iterable[Union[Callable, Type[Exception]]]] = None,
-                 listeners: Optional[Iterable[CircuitBreakerListener]] = None,
-                 state_storage: Optional[CircuitBreakerStorage] = None,
-                 name: Optional[str] = None):
+    def __init__(
+        self,
+        fail_max: int = 5,
+        timeout_duration: timedelta | None = None,
+        exclude: Iterable[ExcludeItem] | None = None,
+        listeners: Iterable[CircuitBreakerListener] | None = None,
+        state_storage: CircuitBreakerStorage | None = None,
+        name: str | None = None,
+    ) -> None:
         """
         Creates a new circuit breaker with the given parameters.
 
-        :param fail_max: The maximum number of failures for the breaker.
-        :param timeout_duration: The timeout to elapse for a breaker to close again.
-        :param exclude: A list of excluded :class:`Exception` types to ignore.
-        :param listeners: A list of :class:`CircuitBreakerListener`
-        :param state_storage: A type of storage. Defaults to :class:`~aiobreaker.storage.memory.CircuitMemoryStorage`
+        :param fail_max: Maximum number of failures before the breaker opens.
+        :param timeout_duration: How long the breaker stays open before
+            allowing a trial call.
+        :param exclude: Exception types or predicates to ignore.
+        :param listeners: Initial set of :class:`CircuitBreakerListener`.
+        :param state_storage: A storage backend. Defaults to in-memory.
+        :param name: Optional name for diagnostics/logging.
         """
-        self._state_storage = state_storage or CircuitMemoryStorage(CircuitBreakerState.CLOSED)
-        self._state = self._create_new_state(self.current_state)
+        self._state_storage: CircuitBreakerStorage = (
+            state_storage or CircuitMemoryStorage(CircuitBreakerState.CLOSED)
+        )
+        self._state: CircuitBreakerBaseState | None = None
+        self._fail_max: int = fail_max
+        self._timeout_duration: timedelta = (
+            timeout_duration if timeout_duration is not None else timedelta(seconds=60)
+        )
+        self._excluded_exceptions: list[ExcludeItem] = list(exclude or [])
+        self._listeners: list[CircuitBreakerListener] = list(listeners or [])
+        self._name: str | None = name
 
-        self._fail_max = fail_max
-        self._timeout_duration = timeout_duration if timeout_duration else timedelta(seconds=60)
+    @classmethod
+    async def create(
+        cls,
+        fail_max: int = 5,
+        timeout_duration: timedelta | None = None,
+        exclude: Iterable[ExcludeItem] | None = None,
+        listeners: Iterable[CircuitBreakerListener] | None = None,
+        state_storage: CircuitBreakerStorage | None = None,
+        name: str | None = None,
+    ) -> "CircuitBreaker":
+        """
+        Async factory: builds the breaker and primes its cached state from
+        the storage backend.
+        """
+        breaker = cls(
+            fail_max=fail_max,
+            timeout_duration=timeout_duration,
+            exclude=exclude,
+            listeners=listeners,
+            state_storage=state_storage,
+            name=name,
+        )
+        await breaker._ensure_state_initialized()
+        return breaker
 
-        self._excluded_exceptions: List[Union[Callable, Type[Exception]]] = list(exclude or [])
-        self._listeners = list(listeners or [])
-        self._name = name
+    async def _ensure_state_initialized(self) -> None:
+        """
+        Lazily builds the cached state object on first use.
+        """
+        if self._state is None:
+            current = await self._state_storage.get_state()
+            self._state = self._build_state(current)
 
-    @property
-    def fail_counter(self):
+    def _build_state(
+        self, new_state: CircuitBreakerState
+    ) -> CircuitBreakerBaseState:
+        """
+        Construct (without invoking ``on_enter``) a state object for the
+        given enum value.
+        """
+        state_cls = new_state.value
+        instance: CircuitBreakerBaseState = state_cls(self)
+        return instance
+
+    async def _transition_to(
+        self, new_state: CircuitBreakerState, notify: bool = True
+    ) -> CircuitBreakerBaseState:
+        """
+        Replace the cached state with a freshly built object for ``new_state``
+        and run its async ``on_enter`` hook.
+        """
+        prev_state = self._state
+        next_state = self._build_state(new_state)
+        self._state = next_state
+        await next_state.on_enter(prev_state=prev_state, notify=notify)
+        return next_state
+
+    async def get_state(self) -> CircuitBreakerBaseState:
+        """
+        Returns the current cached state object, refreshing it from storage
+        if it has drifted (e.g. another process changed the shared state).
+        """
+        await self._ensure_state_initialized()
+        assert self._state is not None
+        current = await self._state_storage.get_state()
+        if current != self._state.state:
+            await self._transition_to(current, notify=True)
+        assert self._state is not None
+        return self._state
+
+    async def get_current_state(self) -> CircuitBreakerState:
+        """
+        Returns the current circuit breaker state enum from the storage.
+        """
+        return await self._state_storage.get_state()
+
+    async def get_fail_counter(self) -> int:
         """
         Returns the current number of consecutive failures.
         """
-        return self._state_storage.counter
+        return await self._state_storage.get_counter()
+
+    async def get_opens_at(self) -> datetime | None:
+        """
+        Returns the UTC datetime at which the breaker will allow another
+        trial call, or ``None`` if it has already elapsed (or never opened).
+        """
+        opened_at = await self._state_storage.get_opened_at()
+        if opened_at is None:
+            return None
+        opens_at = opened_at + self._timeout_duration
+        if opens_at < datetime.now(timezone.utc):
+            return None
+        return opens_at
+
+    async def get_time_until_open(self) -> timedelta | None:
+        """
+        Returns the remaining time until the breaker will retry, or
+        ``None`` if it has already elapsed.
+        """
+        opens_at = await self.get_opens_at()
+        if opens_at is None:
+            return None
+        remaining = opens_at - datetime.now(timezone.utc)
+        if remaining < timedelta(0):
+            return None
+        return remaining
+
+    async def sleep_until_open(self) -> None:
+        """
+        Sleeps asynchronously until the breaker will accept another call.
+        No-op if there is no remaining timeout.
+        """
+        remaining = await self.get_time_until_open()
+        if remaining is not None and remaining.total_seconds() > 0:
+            await asyncio.sleep(remaining.total_seconds())
 
     @property
-    def fail_max(self):
+    def fail_max(self) -> int:
         """
-        Returns the maximum number of failures tolerated before the circuit is opened.
+        Returns the maximum number of failures tolerated before the circuit
+        is opened.
         """
         return self._fail_max
 
     @fail_max.setter
-    def fail_max(self, number):
-        """
-        Sets the maximum `number` of failures tolerated before the circuit is opened.
-        """
+    def fail_max(self, number: int) -> None:
         self._fail_max = number
 
     @property
-    def timeout_duration(self):
+    def timeout_duration(self) -> timedelta:
         """
-        Once this circuit breaker is opened, it should remain opened until the timeout period elapses.
+        Returns how long the breaker stays open before allowing a trial call.
         """
         return self._timeout_duration
 
     @timeout_duration.setter
-    def timeout_duration(self, timeout: datetime):
-        """
-        Sets the timeout period this circuit breaker should be kept open.
-        """
+    def timeout_duration(self, timeout: timedelta) -> None:
         self._timeout_duration = timeout
 
     @property
-    def opens_at(self) -> Optional[datetime]:
-        """Gets the remaining timeout for a breaker."""
-        open_at = self._state_storage.opened_at + self.timeout_duration
-        if open_at < datetime.now():
-            return None
-        else:
-            return open_at
-
-    @property
-    def time_until_open(self) -> Optional[timedelta]:
+    def excluded_exceptions(self) -> tuple[ExcludeItem, ...]:
         """
-        Returns a timedelta representing the difference between the current
-        time and when the breaker closes again, or None if it has elapsed.
-        """
-        opens_in = self.opens_at - datetime.now()
-        if opens_in < timedelta(0):
-            return None
-        return opens_in
-
-    async def sleep_until_open(self):
-        await asyncio.sleep(self.time_until_open.total_seconds())
-
-    def _create_new_state(self, new_state: CircuitBreakerState, prev_state=None,
-                          notify=False) -> 'CircuitBreakerBaseState':
-        """
-        Return state object from state string, i.e.,
-        'closed' -> <CircuitClosedState>
-        """
-
-        try:
-            return new_state.value(self, prev_state=prev_state, notify=notify)
-        except KeyError:
-            msg = "Unknown state {!r}, valid states: {}"
-            raise ValueError(msg.format(new_state, ', '.join(state.value for state in CircuitBreakerState)))
-
-    @property
-    def state(self):
-        """
-        Update (if needed) and returns the cached state object.
-        """
-        # Ensure cached state is up-to-date
-        if self.current_state != self._state.state:
-            # If cached state is out-of-date, that means that it was likely
-            # changed elsewhere (e.g. another process instance). We still send
-            # out a notification, informing others that this particular circuit
-            # breaker instance noticed the changed circuit.
-            self.state = self.current_state
-        return self._state
-
-    @state.setter
-    def state(self, state_str):
-        """
-        Set cached state and notify listeners of newly cached state.
-        """
-        self._state = self._create_new_state(
-            state_str, prev_state=self._state, notify=True)
-
-    @property
-    def current_state(self) -> CircuitBreakerState:
-        """
-        Returns a CircuitBreakerState that identifies the state of the circuit breaker.
-        """
-        return self._state_storage.state
-
-    @property
-    def excluded_exceptions(self) -> tuple:
-        """
-        Returns a tuple of the excluded exceptions, e.g., exceptions that should
-        not be considered system errors by this circuit breaker.
+        Returns a tuple of the excluded exception types/predicates.
         """
         return tuple(self._excluded_exceptions)
 
-    def add_excluded_exception(self, exception: Type[Exception]):
-        """
-        Adds an exception to the list of excluded exceptions.
-        """
+    def add_excluded_exception(self, exception: ExcludeItem) -> None:
         self._excluded_exceptions.append(exception)
 
-    def add_excluded_exceptions(self, *exceptions):
-        """
-        Adds exceptions to the list of excluded exceptions.
-
-        :param exceptions: Any Exception types you wish to ignore.
-        """
+    def add_excluded_exceptions(self, *exceptions: ExcludeItem) -> None:
         for exc in exceptions:
             self.add_excluded_exception(exc)
 
-    def remove_excluded_exception(self, exception: Type[Exception]):
-        """
-        Removes an exception from the list of excluded exceptions.
-        """
+    def remove_excluded_exception(self, exception: ExcludeItem) -> None:
         self._excluded_exceptions.remove(exception)
 
-    def _inc_counter(self):
+    async def _inc_counter(self) -> None:
         """
-        Increments the counter of failed calls.
+        Increments the failure counter in storage.
         """
-        self._state_storage.increment_counter()
+        await self._state_storage.increment_counter()
 
-    def is_system_error(self, exception: Exception):
+    def is_system_error(self, exception: BaseException) -> bool:
         """
-        Returns whether the exception `exception` is considered a signal of
-        system malfunction. Business exceptions should not cause this circuit
-        breaker to open.
+        Returns whether ``exception`` should count as a system error and
+        therefore trip the breaker. Excluded exception types and predicates
+        return ``False``.
         """
         exception_type = type(exception)
         for exclusion in self._excluded_exceptions:
-            if type(exclusion) is type:
+            if isinstance(exclusion, type):
                 if issubclass(exception_type, exclusion):
                     return False
             elif callable(exclusion):
                 if exclusion(exception):
                     return False
-
         return True
 
-    def call(self, func: Callable, *args, **kwargs):
+    async def call_async(
+        self,
+        func: Callable[..., Awaitable[T]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> T:
         """
-        Calls `func` with the given `args` and `kwargs` according to the rules
-        implemented by the current state of this circuit breaker.
-        """
-        if getattr(func, "_ignore_on_call", False):
-            # if the function has set `_ignore_on_call` to True,
-            # it is a decorator that needs to avoid triggering
-            # the circuit breaker twice
-            return func(*args, **kwargs)
-
-        return self.state.call(func, *args, **kwargs)
-
-    async def call_async(self, func: Callable[..., Coroutine], *args, **kwargs):
-        """
-        Calls `func` with the given `args` and `kwargs` according to the rules
-        implemented by the current state of this circuit breaker.
+        Calls the async ``func`` according to the rules of the current state.
         """
         if getattr(func, "_ignore_on_call", False):
-            # if the function has set `_ignore_on_call` to True,
-            # it is a decorator that needs to avoid triggering
-            # the circuit breaker twice
             return await func(*args, **kwargs)
 
-        return await self.state.call_async(func, *args, **kwargs)
+        state = await self.get_state()
+        return await state.call_async(func, *args, **kwargs)
 
-    def open(self):
+    async def open(self) -> None:
         """
-        Opens the circuit, e.g., the following calls will immediately fail
-        until timeout elapses.
+        Opens the circuit. Subsequent calls fail fast until the timeout
+        elapses.
         """
-        self._state_storage.opened_at = datetime.utcnow()
-        self.state = self._state_storage.state = CircuitBreakerState.OPEN
+        await self._state_storage.set_opened_at(datetime.now(timezone.utc))
+        await self._state_storage.set_state(CircuitBreakerState.OPEN)
+        await self._transition_to(CircuitBreakerState.OPEN, notify=True)
 
-    def half_open(self):
+    async def half_open(self) -> None:
         """
-        Half-opens the circuit, e.g. lets the following call pass through and
-        opens the circuit if the call fails (or closes the circuit if the call
-        succeeds).
+        Half-opens the circuit, letting the next call act as a trial.
         """
-        self.state = self._state_storage.state = CircuitBreakerState.HALF_OPEN
+        await self._state_storage.set_state(CircuitBreakerState.HALF_OPEN)
+        await self._transition_to(CircuitBreakerState.HALF_OPEN, notify=True)
 
-    def close(self):
+    async def close(self) -> None:
         """
-        Closes the circuit, e.g. lets the following calls execute as usual.
+        Closes the circuit, returning to normal operation.
         """
-        self.state = self._state_storage.state = CircuitBreakerState.CLOSED
+        await self._state_storage.set_state(CircuitBreakerState.CLOSED)
+        await self._transition_to(CircuitBreakerState.CLOSED, notify=True)
 
-    def __call__(self, *call_args, ignore_on_call=True):
+    def __call__(
+        self,
+        *call_args: Any,
+        ignore_on_call: bool = True,
+    ) -> Callable[..., Any]:
         """
-        Decorates the function such that calls are handled according to the rules
-        implemented by the current state of this circuit breaker.
+        Decorates an async function so its calls are routed through this
+        breaker. Synchronous functions are rejected with ``TypeError`` —
+        this library is async-only.
 
-        :param ignore_on_call: Whether the decorated function should be ignored when using
-            :func:`~CircuitBreaker.call`, preventing the breaker being triggered twice.
+        :param ignore_on_call: When ``True`` the wrapped function will not
+            re-trigger the breaker if it is invoked via :meth:`call_async`.
         """
 
-        def _outer_wrapper(func):
+        def _outer_wrapper(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+            if not inspect.iscoroutinefunction(func):
+                raise TypeError(
+                    "CircuitBreaker can only decorate async functions; "
+                    f"{getattr(func, '__name__', func)!r} is synchronous."
+                )
+
             @wraps(func)
-            def _inner_wrapper(*args, **kwargs):
-                return self.call(func, *args, **kwargs)
-
-            @wraps(func)
-            async def _inner_wrapper_async(*args, **kwargs):
+            async def _inner_wrapper_async(*args: Any, **kwargs: Any) -> T:
                 return await self.call_async(func, *args, **kwargs)
 
-            return_func = _inner_wrapper_async if inspect.iscoroutinefunction(func) else _inner_wrapper
-            return_func._ignore_on_call = ignore_on_call
-            return return_func
+            _inner_wrapper_async._ignore_on_call = ignore_on_call  # type: ignore[attr-defined]
+            return _inner_wrapper_async
 
-        if len(call_args) == 1 and inspect.isfunction(call_args[0]):
-            # if decorator called without arguments, pass the function on
-            return _outer_wrapper(*call_args)
-        elif len(call_args) == 0:
-            # if decorator called with arguments, _outer_wrapper will receive the function
+        if len(call_args) == 1 and (
+            inspect.isfunction(call_args[0]) or inspect.ismethod(call_args[0])
+        ):
+            return _outer_wrapper(call_args[0])
+        if len(call_args) == 0:
             return _outer_wrapper
-        else:
-            raise TypeError("Decorator does not accept positional arguments.")
+        raise TypeError("Decorator does not accept positional arguments.")
 
     @property
-    def listeners(self):
-        """
-        Returns the registered listeners as a tuple.
-        """
+    def listeners(self) -> tuple[CircuitBreakerListener, ...]:
         return tuple(self._listeners)
 
-    def add_listener(self, listener):
-        """
-        Registers a listener for this circuit breaker.
-        """
+    def add_listener(self, listener: CircuitBreakerListener) -> None:
         self._listeners.append(listener)
 
-    def add_listeners(self, *listeners):
-        """
-        Registers listeners for this circuit breaker.
-        """
+    def add_listeners(self, *listeners: CircuitBreakerListener) -> None:
         for listener in listeners:
             self.add_listener(listener)
 
-    def remove_listener(self, listener):
-        """
-        Unregisters a listener of this circuit breaker.
-        """
+    def remove_listener(self, listener: CircuitBreakerListener) -> None:
         self._listeners.remove(listener)
 
     @property
-    def name(self) -> str:
-        """
-        Returns the name of this circuit breaker. Useful for logging.
-        """
+    def name(self) -> str | None:
         return self._name
 
     @name.setter
-    def name(self, name: str):
-        """
-        Set the name of this circuit breaker.
-        """
+    def name(self, name: str | None) -> None:
         self._name = name
+
+
+__all__ = ("CircuitBreaker", "CircuitBreakerError")
